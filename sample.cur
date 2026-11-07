@@ -1,0 +1,49 @@
+// Valid Currency-C program: no semantic errors
+struct Account {
+    int id;
+    currency<INR> balance;
+};
+
+int count = 3;
+float rate = 0.05;
+currency<INR> price = ₹500;
+currency<INR> total;
+currency<USD> bonus = $20.50;
+int values[3];
+int *p = &count;
+struct Account acc;
+struct Account *accPtr = &acc;
+FILE *fp = 0;
+
+input(count);
+input(price);
+
+acc.id = 1;
+acc.balance = price * 2;
+accPtr->balance = accPtr->balance + ₹250.75;
+total = acc.balance - (price - ₹100);
+values[0] = count;
+*p = *p + 1;
+values[1] = -(-*p);
+
+output(total);
+output(bonus);
+output(rate);
+output(values[1]);
+output(accPtr->balance / 4);
+
+while (count > 0 && total > price) {
+    output(count);
+    count = count - 1;
+}
+
+if (count == 0) {
+    output(acc.id);
+} else if (total <= price) {
+    output(price);
+} else {
+    output(bonus * 2);
+}
+
+if (fp) { fclose(fp); }
+return 0;
