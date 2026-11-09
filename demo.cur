@@ -1,0 +1,19 @@
+struct Account {
+    int id;
+    currency<INR> balance;
+};
+currency<INR> price = ₹500;
+currency<INR> total;
+int count = 3;
+struct Account acc;
+struct Account *p = &acc;
+acc.id = 1;
+acc.balance = price * 2;
+p->balance = p->balance + ₹250.75;
+total = acc.balance + ₹250.75;
+output(total);
+output(p->balance);
+while (count > 0) {
+    output(count);
+    count = count - 1;
+}

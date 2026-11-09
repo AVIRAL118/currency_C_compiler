@@ -7,9 +7,10 @@ Translation rules
 -----------------
   types      currency<XXX>  -> float          (pointers keep their '*': float *p)
              int / float / FILE / struct X    -> unchanged
-  literals   currency<INR> x = ₹500;          -> float x = 500.00;
+  literals   currency<INR> x = ₹500;          -> float x = 500.00f;
   output(e)  int expression                   -> printf("%d\\n", e);
-             float / currency expression      -> printf("%.2f\\n", e);
+             float expression                 -> printf("%.2f\\n", e);
+             currency<XXX> expression         -> printf("₹%.2f\\n", e);   (symbol of its code)
              pointer expression               -> printf("%p\\n", (void *)e);
   input(t)   int target                       -> scanf("%d", &t);
              float / currency target          -> scanf("%f", &t);
@@ -36,12 +37,14 @@ The semantic analyzer returns expression types but does not annotate the AST, an
 output()/input() need those types to choose a printf/scanf format. CodeGen
 therefore drives an internal SemanticAnalyzer in lock-step (declarations and
 scopes), purely as a type oracle. Its diagnostics are ignored; run the analyzer
-yourself first (see __main__) and only generate code when it reports no errors.
+yourself first (see compile_source) and only generate code when it reports no errors.
 
 Usage:
     python codegen.py                  # translate sample.cur (or a built-in sample)
     python codegen.py program.cur      # translate a file, writes output.c
+    python codegen.py prog.cur -o x.c  # choose the output file name
     python codegen.py --plain          # plain printf("%.2f\\n", x) output, no labels/prompts
+    python codegen.py --currency-output code   # print 'INR 12.50' instead of '₹12.50' (or: none)
     python codegen.py prog.cur --dump-ast   # print the validated AST and exit (no output.c)
     python codegen.py -                # read the Currency-C source from stdin
 
@@ -56,11 +59,11 @@ import os
 import sys
 
 from lexer import Lexer, LexerError
-from parser import (Parser, ParseError, Program, StructDef, Declaration, Block, If,
-                    While, Input, Output, Return, ExprStmt, Assignment, BinaryOp,
-                    UnaryOp, IntLiteral, FloatLiteral, CurrencyLiteral, Identifier,
-                    MemberAccess, Index, FileCall, dump)
+from parser import (Parser, ParseError, StructDef, Block, If, Output, Return,
+                    BinaryOp, UnaryOp, IntLiteral, Identifier, MemberAccess,
+                    Index, FileCall, dump)
 from semantic import SemanticAnalyzer
+from symbol_table import CURRENCY_SYMBOLS
 
 
 class CodeGenError(Exception):
@@ -79,14 +82,32 @@ UNARY_PREC = 7
 POSTFIX_PREC = 8
 ATOM_PREC = 9
 
+# How output() of a currency value is prefixed: its symbol (₹12.50), its code (INR 12.50), or nothing.
+CURRENCY_OUTPUT_MODES = ("symbol", "code", "none")
+CODE_TO_SYMBOL = {code: sym for sym, code in CURRENCY_SYMBOLS.items()}
+
+# Unary operators that must not be glued to an identical leading character
+# ('--x' would be a decrement, '&&x' a logical-and token).
+_SELF_CLASHING_UNARY = ("-", "&")
+
+
+def _c_escape(text):
+    """Escape `text` for use inside a C string literal that is also a printf format."""
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+
 
 class CodeGen:
     INDENT = "    "
 
-    def __init__(self, labels=True, program_name: str | None = None):
+    def __init__(self, labels=True, program_name: str | None = None,
+                 currency_output="symbol"):
         # labels=True : output(x) prints "x = 12.50" and input(x) shows a prompt
-        # labels=False: plain format, printf("%.2f\\n", x) with no prompts
+        # labels=False: plain format, printf("%.2f\\n", x) with no banner or prompts
+        # currency_output: 'symbol' (₹12.50) | 'code' (INR 12.50) | 'none' (12.50)
+        if currency_output not in CURRENCY_OUTPUT_MODES:
+            raise ValueError(f"currency_output must be one of {CURRENCY_OUTPUT_MODES}")
         self.labels = labels
+        self.currency_output = currency_output
         self.program_name = program_name
         self._header_name = program_name
         self._reset()
@@ -145,6 +166,12 @@ class CodeGen:
         self._scopes.exit_scope()
         self.level -= 1
 
+    def _emit_branch(self, stmt):
+        """Emit a control-flow body one output-indent level deeper."""
+        self.ctrl_depth += 1
+        self._emit_body(stmt)
+        self.ctrl_depth -= 1
+
     # ------------------------------------------------------------ top level
     def visit_Program(self, node):
         structs = [i for i in node.items if isinstance(i, StructDef)]
@@ -163,12 +190,15 @@ class CodeGen:
 
         self.emit("int main(void) {")
         self.level += 1
-        self.emit('printf("── Currency-C run ──\\n");')
-        for idx, item in enumerate(body):
+        if self.labels:                         # banner only in the labelled mode
+            self.emit('printf("── Currency-C run ──\\n");')
+        prev = None
+        for item in body:
             self.visit(item)
-            if isinstance(item, Output) and idx > 0 and isinstance(body[idx - 1], Output):
-                self.emit('printf("\\n");')          # runtime blank line
-        if not body or not isinstance(body[-1], Return):
+            if self.labels and isinstance(item, Output) and isinstance(prev, Output):
+                self.emit('printf("\\n");')          # runtime blank line (labelled mode only)
+            prev = item
+        if not isinstance(prev, Return):
             self.emit("return 0;")
         self.level -= 1
         self.emit("}")
@@ -215,28 +245,20 @@ class CodeGen:
 
     def visit_If(self, node):
         self.emit(f"if ({self.expr(node.condition)}) {{")
-        self.ctrl_depth += 1
-        self._emit_body(node.then_branch)
-        self.ctrl_depth -= 1
+        self._emit_branch(node.then_branch)
         other = node.else_branch
         while isinstance(other, If):            # flatten 'else if' chains
             self.emit(f"}} else if ({self.expr(other.condition)}) {{")
-            self.ctrl_depth += 1
-            self._emit_body(other.then_branch)
-            self.ctrl_depth -= 1
+            self._emit_branch(other.then_branch)
             other = other.else_branch
         if other is not None:
             self.emit("} else {")
-            self.ctrl_depth += 1
-            self._emit_body(other)
-            self.ctrl_depth -= 1
+            self._emit_branch(other)
         self.emit("}")
 
     def visit_While(self, node):
         self.emit(f"while ({self.expr(node.condition)}) {{")
-        self.ctrl_depth += 1
-        self._emit_body(node.body)
-        self.ctrl_depth -= 1
+        self._emit_branch(node.body)
         self.emit("}")
 
     def visit_Assignment(self, node):
@@ -250,22 +272,30 @@ class CodeGen:
         value = self.expr(node.value) if node.value is not None else "0"
         self.emit(f"return {value};")
 
+    def _currency_prefix(self, t):
+        """Text printed before a currency value: '₹', 'INR ' or ''."""
+        if not t.is_currency:
+            return ""
+        if self.currency_output == "symbol":
+            return CODE_TO_SYMBOL.get(t.currency_code, "")
+        if self.currency_output == "code":
+            return f"{t.currency_code} "
+        return ""
+
     def visit_Output(self, node):
         t = self._type_of(node.value)
-        value = self.expr(node.value)
         if t.is_pointer:
             fmt, arg = "%p", f"(void *){self.expr(node.value, UNARY_PREC)}"
         elif t.is_currency or t.is_float:
-            fmt, arg = "%.2f", value
+            fmt, arg = f"{self._currency_prefix(t)}%.2f", self.expr(node.value)
         elif t.is_numeric:                      # int
-            fmt, arg = "%d", value
+            fmt, arg = "%d", self.expr(node.value)
         else:
             raise CodeGenError(f"cannot output a value of type {t}", node.line_number)
 
         label = self._lvalue_label(node.value) if self.labels else None
         if label is not None:                   # e.g. printf("  count = %d\n", count);
-            label = " " * self.ctrl_depth + label
-            label = label.replace("\\", "\\\\").replace('"', '\\"')
+            label = _c_escape(" " * self.ctrl_depth + label)
             self.emit(f'printf("{label} = {fmt}\\n", {arg});')
         else:                                   # not a plain lvalue: unlabelled form
             self.emit(f'printf("{fmt}\\n", {arg});')
@@ -299,8 +329,7 @@ class CodeGen:
 
         label = self._lvalue_label(node.target) if self.labels else None
         if label is not None:                   # e.g. printf("acc.balance: ");
-            label = label.replace("\\", "\\\\").replace('"', '\\"')
-            self.emit(f'printf("{label}: ");')
+            self.emit(f'printf("{_c_escape(label)}: ");')
             self.emit("fflush(stdout);")
         self.emit(f'scanf("{fmt}", &{self.expr(node.target, POSTFIX_PREC)});')
 
@@ -333,11 +362,15 @@ class CodeGen:
         return node.text
 
     def expr_CurrencyLiteral(self, node):
-        # The symbol only carries type information; the value is the bare number.
+        # The symbol only carries type information; the value is the bare number,
+        # with an 'f' suffix so it is a float constant like the variable it initialises.
         amount = node.amount
         if isinstance(amount, IntLiteral):
-            return f"{amount.value}.00"         # ₹500 -> 500.00
-        return amount.text                      # ₹50000.00 -> 50000.00
+            return f"{amount.value}.00f"        # ₹500 -> 500.00f
+        return f"{amount.text}f"                # ₹50000.00 -> 50000.00f
+
+    def expr_StringLiteral(self, node):
+        return node.value                       # already a valid C literal, quotes included
 
     def expr_Identifier(self, node):
         return node.name
@@ -350,7 +383,7 @@ class CodeGen:
 
     def expr_UnaryOp(self, node):
         operand = self.expr(node.operand, UNARY_PREC)
-        if node.op in "-&" and operand.startswith(node.op):
+        if node.op in _SELF_CLASHING_UNARY and operand.startswith(node.op):
             operand = f"({operand})"            # never emit '--x' or '&&x'
         return f"{node.op}{operand}"
 
@@ -366,7 +399,7 @@ class CodeGen:
 
 
 # ---------------------------------------------------------------------------
-# Demo: Lexer -> Parser -> Semantic Analyzer -> CodeGen
+# Pipeline: Lexer -> Parser -> Semantic Analyzer -> CodeGen
 # ---------------------------------------------------------------------------
 FALLBACK_SAMPLE = """\
 struct Account {
@@ -390,8 +423,12 @@ while (count > 0) {
 """
 
 
-def compile_source(source, out_path="output.c", labels=True, program_name=None):
-    """Run the whole pipeline on `source`; returns the C code, or None on errors."""
+def analyze_source(source):
+    """Lex, parse and analyze `source`.
+
+    Returns (program, analyzer), or None if lexing/parsing failed (the error is
+    printed to stderr). Semantic diagnostics are reported but not fatal here;
+    callers check `analyzer.errors`."""
     try:
         program = Parser.from_source(source).parse()
     except (LexerError, ParseError) as err:
@@ -402,74 +439,84 @@ def compile_source(source, out_path="output.c", labels=True, program_name=None):
     analyzer.analyze(program)
     if analyzer.diagnostics:
         analyzer.report()
+    return program, analyzer
+
+
+def compile_source(source, out_path="output.c", labels=True, program_name=None,
+                   currency_output="symbol"):
+    """Run the whole pipeline on `source`; returns the C code, or None on errors."""
+    result = analyze_source(source)
+    if result is None:
+        return None
+    program, analyzer = result
     if analyzer.errors:
         print("Semantic errors found; no code generated.", file=sys.stderr)
         return None
+    return CodeGen(labels=labels, currency_output=currency_output).generate(
+        program, out_path, program_name)
 
-    return CodeGen(labels=labels).generate(program, out_path, program_name)
+
+def read_source(path):
+    """Read Currency-C source from `path` ('-' = stdin). Returns (source, display_name)."""
+    if path == "-":
+        return sys.stdin.buffer.read().decode("utf-8"), "<stdin>"
+    return Lexer.from_file(path).source, os.path.basename(path)
 
 
-def dump_ast(path):
-    """Debug hook: lex, parse and analyze `path`, print the AST tree, write nothing."""
-    try:
-        source = Lexer.from_file(path).source
-        program = Parser.from_source(source).parse()
-    except OSError as err:
-        print(err, file=sys.stderr)
+def dump_ast(source):
+    """Debug hook: parse and analyze `source`, print the AST tree, write nothing."""
+    result = analyze_source(source)
+    if result is None:
         return 1
-    except (LexerError, ParseError) as err:
-        print(err, file=sys.stderr)
-        return 1
-
-    analyzer = SemanticAnalyzer()
-    analyzer.analyze(program)
-    if analyzer.diagnostics:
-        analyzer.report()                       # shown, but the tree is still dumped
+    program, analyzer = result
     dump(program)                               # parser.dump prints the tree itself
-    return 1 if analyzer.errors else 0
+    return 1 if analyzer.errors else 0          # diagnostics shown, tree still dumped
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Currency-C -> C code generator")
     ap.add_argument("path", nargs="?", help="Currency-C source file (default: sample.cur)")
+    ap.add_argument("-o", "--output", default="output.c",
+                    help="output C file (default: output.c)")
     ap.add_argument("--plain", action="store_true",
-                    help="plain printf output: no labels or input prompts")
+                    help="plain printf output: no banner, labels or input prompts")
+    ap.add_argument("--currency-output", choices=CURRENCY_OUTPUT_MODES, default="symbol",
+                    help="how output() prints currency values: symbol (default), code or none")
     ap.add_argument("--dump-ast", action="store_true",
                     help="print the validated AST and exit without generating C")
     args = ap.parse_args(argv)
 
+    if args.dump_ast and not args.path:
+        ap.error("--dump-ast requires a .cur file argument")
+
+    path = args.path
+    if path is None:
+        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample.cur")
+        path = default if os.path.exists(default) else None
+
+    try:
+        if path is None:
+            source, name, shown = FALLBACK_SAMPLE, "<built-in sample>", \
+                "built-in sample (sample.cur not found)"
+        else:
+            source, name = read_source(path)
+            shown = name if path == "-" else path
+    except OSError as err:                      # an explicit bad path is an error,
+        print(err, file=sys.stderr)             # not a silent switch to the sample
+        return 1
+
     if args.dump_ast:
-        if not args.path:
-            ap.error("--dump-ast requires a .cur file argument")
-        return dump_ast(args.path)
+        return dump_ast(source)
 
-    labels = not args.plain
-    if args.path:
-        path = args.path
-    else:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample.cur")
-
-    if path == "-":
-        source = sys.stdin.buffer.read().decode("utf-8")
-        program_name = "<stdin>"
-        print("// Source: <stdin>")
-    elif os.path.exists(path):
-        source = Lexer.from_file(path).source
-        program_name = os.path.basename(path)
-        print(f"// Source: {path}")
-    else:
-        source = FALLBACK_SAMPLE
-        program_name = "<built-in sample>"
-        print("// Source: built-in sample (sample.cur not found)")
-
+    print(f"// Source: {shown}")
     print("// ---------------- Currency-C ----------------")
     print(source)
 
-    code = compile_source(source, "output.c", labels, program_name)
+    code = compile_source(source, args.output, not args.plain, name, args.currency_output)
     if code is None:
         return 1
 
-    print("// ---------------- Generated C (written to output.c) ----------------")
+    print(f"// ---------------- Generated C (written to {args.output}) ----------------")
     print(code)
     return 0
 

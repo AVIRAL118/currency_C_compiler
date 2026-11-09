@@ -36,7 +36,7 @@ Grammar implemented (one parse_* method per rule):
     term           := unary      { ('*' | '/') unary }
     unary          := ('-' | '&' | '*') unary | postfix
     postfix        := primary    { '.' IDENT | '->' IDENT | '[' expression ']' }
-    primary        := INT | FLOAT | currency_literal | file_call | IDENT
+    primary        := INT | FLOAT | STRING | currency_literal | file_call | IDENT
                     | '(' expression ')'
     currency_literal := CURRENCY_SYMBOL (INT | FLOAT)
     file_call      := FILE_FUNC '(' [ expression { ',' expression } ] ')'
@@ -49,18 +49,27 @@ Design notes:
     or '&' is TYPE-correct is a Phase 3 question.
   * An assignment target is parsed as an ordinary expression first, then checked
     for being an lvalue. This avoids any backtracking.
+  * Binary operators use precedence climbing over BINARY_LEVELS (one loop instead
+    of one method per level).
+  * Error handling: parse() raises ParseError on the FIRST syntax error (default).
+    parse(recover=True) instead uses panic-mode recovery (skip to the next ';' or
+    '}'), never raises ParseError, and collects every error in `Parser.errors`.
+    A tree built with recover=True may be incomplete - do not generate code from
+    it unless `errors` is empty.
 
 Usage:
-    python parser.py                # parse the lexer's built-in sample
-    python parser.py program.cur    # parse a file
+    python parser.py                    # parse the lexer's built-in sample
+    python parser.py program.cur        # parse a file
+    python parser.py program.cur --recover   # report all syntax errors, not just the first
 
     from parser import Parser
     ast = Parser.from_source(text).parse()
 """
 
+import argparse
 import sys
 from dataclasses import dataclass, field, fields
-from typing import List, Optional
+from typing import List, NoReturn, Optional
 
 from lexer import Lexer, LexerError, Token, TokenStream, TokenType, SAMPLE_SOURCE
 
@@ -69,7 +78,7 @@ from lexer import Lexer, LexerError, Token, TokenStream, TokenType, SAMPLE_SOURC
 # Errors
 # ---------------------------------------------------------------------------
 class ParseError(Exception):
-    """Raised on the first syntax error (with the offending line number)."""
+    """A syntax error, carrying the offending line number."""
 
     def __init__(self, message, line_number):
         super().__init__(f"Syntax error at line {line_number}: {message}")
@@ -205,6 +214,12 @@ class FloatLiteral(Node):
 
 
 @dataclass
+class StringLiteral(Node):
+    value: str = ""                        # exact lexeme INCLUDING the quotes, e.g. '"log.txt"'
+    line_number: int = 0
+
+
+@dataclass
 class CurrencyLiteral(Node):
     symbol: str = ""                       # '$' | '₹' | '€' | '£'
     amount: Optional[Node] = None          # IntLiteral | FloatLiteral
@@ -253,11 +268,22 @@ BINARY_LEVELS = [
     ("+", "-"),
     ("*", "/"),
 ]
+BINARY_PREC = {op: prec for prec, ops in enumerate(BINARY_LEVELS, 1) for op in ops}
+
+NUMBER_TOKENS = (TokenType.INT_LITERAL, TokenType.FLOAT_LITERAL)
 
 
 class Parser:
+    MAX_ERRORS = 20                         # recovery mode gives up after this many
+
     def __init__(self, tokens):
         self.stream = TokenStream(tokens)
+        self.errors: List[ParseError] = []  # filled only by parse(recover=True)
+        self._keyword_stmt = {              # keyword -> statement parser
+            "if": self.parse_if, "while": self.parse_while,
+            "input": self.parse_input, "output": self.parse_output,
+            "return": self.parse_return,
+        }
 
     @classmethod
     def from_source(cls, source):
@@ -269,7 +295,7 @@ class Parser:
     def _describe(tok: Token) -> str:
         return "end of input" if tok.type == TokenType.EOF else repr(tok.value)
 
-    def _error(self, message, tok=None):
+    def _error(self, message, tok=None) -> NoReturn:
         tok = tok or self.stream.peek()
         raise ParseError(message, tok.line_number)
 
@@ -287,19 +313,37 @@ class Parser:
     def _check_op(self, value):
         return self.stream.check(TokenType.OPERATOR, value)
 
-    def _check_kw(self, value):
-        return self.stream.check(TokenType.KEYWORD, value)
-
     # ----- program & declarations ------------------------------------------
-    def parse(self) -> Program:
-        """Entry point: parse the whole token stream into a Program node."""
+    def parse(self, recover=False) -> Program:
+        """Entry point: parse the whole token stream into a Program node.
+
+        recover=False: raise ParseError at the first syntax error.
+        recover=True : skip past each error, collect them in self.errors and
+                       return whatever parsed cleanly."""
+        self.errors = []
         items = []
         while not self.stream.check(TokenType.EOF):
-            if self._at_struct_def():
-                items.append(self.parse_struct_def())
-            else:
-                items.append(self.parse_statement())
+            try:
+                items.append(self._parse_item())
+            except ParseError as err:
+                if not recover:
+                    raise
+                self.errors.append(err)
+                if len(self.errors) >= self.MAX_ERRORS:
+                    break
+                self._synchronize()
         return Program(items=items, line_number=1)
+
+    def _parse_item(self) -> Node:
+        return self.parse_struct_def() if self._at_struct_def() else self.parse_statement()
+
+    def _synchronize(self):
+        """Panic-mode recovery: discard tokens up to and including the next ';' or '}'.
+        Always consumes at least one token (unless at EOF), so parsing cannot loop."""
+        while not self.stream.check(TokenType.EOF):
+            tok = self.stream.advance()
+            if tok.type == TokenType.DELIMITER and tok.value in (";", "}"):
+                return
 
     def _at_struct_def(self) -> bool:
         """'struct NAME {' is a definition; 'struct NAME x' is a declaration."""
@@ -367,16 +411,9 @@ class Parser:
         if tok.type == TokenType.KEYWORD:
             if tok.value in TYPE_KEYWORDS:
                 return self.parse_declaration()
-            if tok.value == "if":
-                return self.parse_if()
-            if tok.value == "while":
-                return self.parse_while()
-            if tok.value == "input":
-                return self.parse_input()
-            if tok.value == "output":
-                return self.parse_output()
-            if tok.value == "return":
-                return self.parse_return()
+            handler = self._keyword_stmt.get(tok.value)
+            if handler is not None:
+                return handler()
             if tok.value == "else":
                 self._error("'else' without a matching 'if'")
         if tok.type == TokenType.DELIMITER and tok.value == "{":
@@ -469,19 +506,20 @@ class Parser:
 
     # ----- expressions -------------------------------------------------------
     def parse_expression(self) -> Node:
-        return self._parse_binary(0)
+        return self._parse_binary(1)
 
-    def _parse_binary(self, level) -> Node:
-        """One method handles all left-associative binary levels in BINARY_LEVELS."""
-        if level == len(BINARY_LEVELS):
-            return self.parse_unary()
-        left = self._parse_binary(level + 1)
-        while (self.stream.peek().type == TokenType.OPERATOR
-               and self.stream.peek().value in BINARY_LEVELS[level]):
-            op = self.stream.advance()
-            right = self._parse_binary(level + 1)
-            left = BinaryOp(op=op.value, left=left, right=right, line_number=op.line_number)
-        return left
+    def _parse_binary(self, min_prec) -> Node:
+        """Precedence climbing: consume operators whose precedence is >= min_prec.
+        Left-associative, because the right operand only takes tighter operators."""
+        left = self.parse_unary()
+        while True:
+            tok = self.stream.peek()
+            prec = BINARY_PREC.get(tok.value) if tok.type == TokenType.OPERATOR else None
+            if prec is None or prec < min_prec:
+                return left
+            self.stream.advance()
+            right = self._parse_binary(prec + 1)
+            left = BinaryOp(op=tok.value, left=left, right=right, line_number=tok.line_number)
 
     def parse_unary(self) -> Node:
         tok = self.stream.peek()
@@ -507,24 +545,32 @@ class Parser:
             else:
                 return node
 
+    @staticmethod
+    def _number_node(tok: Token) -> Node:
+        """INT_LITERAL / FLOAT_LITERAL token -> IntLiteral / FloatLiteral."""
+        if tok.type == TokenType.INT_LITERAL:
+            return IntLiteral(value=int(tok.value), line_number=tok.line_number)
+        return FloatLiteral(value=float(tok.value), text=tok.value, line_number=tok.line_number)
+
     def parse_primary(self) -> Node:
         tok = self.stream.peek()
 
-        if tok.type == TokenType.INT_LITERAL:
+        if tok.type in NUMBER_TOKENS:
             self.stream.advance()
-            return IntLiteral(value=int(tok.value), line_number=tok.line_number)
+            return self._number_node(tok)
 
-        if tok.type == TokenType.FLOAT_LITERAL:
+        if tok.type == TokenType.STRING_LITERAL:
             self.stream.advance()
-            return FloatLiteral(value=float(tok.value), text=tok.value, line_number=tok.line_number)
+            return StringLiteral(value=tok.value, line_number=tok.line_number)
 
         if tok.type == TokenType.CURRENCY_SYMBOL:
             self.stream.advance()
             amount = self.stream.peek()
-            if amount.type not in (TokenType.INT_LITERAL, TokenType.FLOAT_LITERAL):
+            if amount.type not in NUMBER_TOKENS:
                 self._error(f"expected a number after currency symbol {tok.value!r} "
                             f"but found {self._describe(amount)}")
-            return CurrencyLiteral(symbol=tok.value, amount=self.parse_primary(),
+            self.stream.advance()
+            return CurrencyLiteral(symbol=tok.value, amount=self._number_node(amount),
                                    line_number=tok.line_number)
 
         if tok.type == TokenType.FILE_FUNCTION:
@@ -609,23 +655,40 @@ BAD_SNIPPETS = [
 ]
 
 
-def main():
-    if len(sys.argv) > 1:
-        source = Lexer.from_file(sys.argv[1]).source
-        print(f"Parsing file: {sys.argv[1]}\n")
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Currency-C parser (prints the AST)")
+    ap.add_argument("path", nargs="?", help="Currency-C source file (default: lexer sample)")
+    ap.add_argument("--recover", action="store_true",
+                    help="keep parsing after a syntax error and report all of them")
+    args = ap.parse_args(argv)
+
+    if args.path:
+        try:
+            source = Lexer.from_file(args.path).source
+        except OSError as err:
+            print(err, file=sys.stderr)
+            return 1
+        print(f"Parsing file: {args.path}\n")
     else:
         source = SAMPLE_SOURCE
         print("Parsing the lexer's built-in sample...\n")
 
     try:
-        program = Parser.from_source(source).parse()
+        parser = Parser.from_source(source)
+        program = parser.parse(recover=args.recover)
     except (LexerError, ParseError) as err:
         print(err, file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     dump(program)
 
-    if len(sys.argv) == 1:      # only show error demos for the built-in run
+    if parser.errors:
+        print(f"\n{len(parser.errors)} syntax error(s):", file=sys.stderr)
+        for err in parser.errors:
+            print(f"  {err}", file=sys.stderr)
+        return 1
+
+    if args.path is None:       # only show error demos for the built-in run
         print("\n--- Error demonstrations ---")
         for snippet in BAD_SNIPPETS:
             try:
@@ -633,7 +696,8 @@ def main():
                 print(f"(no error?)  {snippet!r}")
             except (LexerError, ParseError) as err:
                 print(f"{snippet!r:<34} -> {err}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -28,6 +28,7 @@ class TokenType(Enum):
     IDENTIFIER      = auto()   # salary, accountNo, ...
     INT_LITERAL     = auto()   # 10
     FLOAT_LITERAL   = auto()   # 50000.00
+    STRING_LITERAL  = auto()   # "log.txt"  (value keeps the surrounding quotes)
     OPERATOR        = auto()   # = + - * / & < > . -> == != <= >= && ||
     DELIMITER       = auto()   # ( ) { } [ ] ; ,
     FILE_FUNCTION   = auto()   # fopen, fclose, fprintf, fscanf, fread, fwrite
@@ -42,7 +43,8 @@ KEYWORDS = {
     "input", "output", "if", "else", "while", "return",
 }
 CURRENCY_CODES = {"INR", "USD", "EUR", "GBP"}
-FILE_FUNCTIONS = {"fopen", "fclose", "fprintf", "fscanf", "fread", "fwrite"}
+FILE_FUNCTIONS = {"fopen", "fclose", "fprintf", "fscanf", "fread", "fwrite",
+                  "fileoutput", "fileinput"}   # last two: reserved, rejected by the semantic phase
 
 # Words that look like identifiers but get a special category.
 # (Identifiers are matched first, then reclassified by this lookup.)
@@ -73,7 +75,7 @@ class Token:
 
 
 class LexerError(Exception):
-    """Raised on an illegal character or unterminated comment."""
+    """Raised on an illegal character, unterminated comment or unterminated string."""
 
     def __init__(self, message, line, column):
         super().__init__(f"Lexical error at line {line}, col {column}: {message}")
@@ -91,6 +93,8 @@ class Lexer:
         ("BLOCK_COMMENT", r"/\*.*?\*/"),               # /* ... */ (may span lines)
         ("BAD_COMMENT",   r"/\*"),                     # '/*' with no closing '*/'
         ("LINE_COMMENT",  r"//[^\n]*"),                # // ... end of line
+        ("STRING",        r'"(?:[^"\\\n]|\\.)*"'),     # "text" with \" and \n escapes (one line)
+        ("BAD_STRING",    r'"'),                       # '"' with no closing quote on its line
         ("FLOAT",         r"\d+\.\d+"),                # 50000.00  (before INT!)
         ("INT",           r"\d+"),                     # 10
         ("WORD",          r"[A-Za-z_][A-Za-z0-9_]*"),  # identifier / keyword / code / file fn
@@ -145,6 +149,12 @@ class Lexer:
 
             elif kind == "BAD_COMMENT":
                 raise LexerError("unterminated block comment", line, column)
+
+            elif kind == "STRING":
+                tokens.append(Token(TokenType.STRING_LITERAL, text, line, column))
+
+            elif kind == "BAD_STRING":
+                raise LexerError("unterminated string literal", line, column)
 
             elif kind == "FLOAT":
                 tokens.append(Token(TokenType.FLOAT_LITERAL, text, line, column))
@@ -231,7 +241,7 @@ struct Account {
     currency<INR> balance;
 };
 
-FILE fp;
+FILE *fp;
 int count = 10;
 float rate = 0.05;
 currency<USD> bonus = $100;
@@ -243,7 +253,7 @@ int *p = &count;
 currency<INR> *ptr;
 struct Account acct, *acctPtr;
 
-fp = fopen(log, 1);
+fp = fopen("log.txt", "w");
 input(salary);
 *p = *p + 1;
 
@@ -256,10 +266,10 @@ if (count == 0) { output(count); }
 if (salary <= tax || bonus >= fee) {
     output(salary);
 } else {
-    fprintf(fp, salary, &count);
-    fscanf(fp, &count);
-    fread(fp, values, 3);
-    fwrite(fp, values, 3);
+    fprintf(fp, "%f %d\\n", salary, count);
+    fscanf(fp, "%d", &count);
+    fread(values, 4, 3, fp);
+    fwrite(values, 4, 3, fp);
 }
 
 acct.balance = salary;
